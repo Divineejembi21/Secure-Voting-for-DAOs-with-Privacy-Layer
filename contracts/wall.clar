@@ -23,7 +23,8 @@
     yes-votes: uint,
     no-votes: uint,
     status: (string-ascii 20),
-    merkle-root: (buff 32)
+    merkle-root: (buff 32),
+    category: (string-ascii 20)
   }
 )
 
@@ -106,7 +107,8 @@
   )
 )
 
-(define-public (create-proposal (title (string-ascii 100)) (description (string-utf8 500)) (duration uint) (merkle-root (buff 32)))
+(define-public (create-proposal (title (string-ascii 100)) (description (string-utf8 500)) (duration uint) (merkle-root (buff 32))     (category (string-ascii 20))
+)
   (let 
     (
       (proposal-id (+ (var-get proposal-count) u1))
@@ -126,7 +128,9 @@
         yes-votes: u0,
         no-votes: u0,
         status: "active",
-        merkle-root: merkle-root
+        merkle-root: merkle-root,
+        category: category
+
       }
     )
     
@@ -207,5 +211,120 @@
     )
     
     (ok true)
+  )
+)
+
+
+
+(define-constant ERR_INVALID_LOCK_TIME (err u112))
+
+(define-map token-lock-time 
+  { user: principal }
+  { lock-height: uint }
+)
+
+(define-read-only (get-time-multiplier (blocks uint))
+  (if (< blocks u10000) 
+    u1
+    (if (< blocks u50000)
+      u2 
+      u3
+    )
+  )
+)
+
+(define-public (lock-tokens (duration uint))
+  (let (
+    (current-height stacks-block-height)
+    (end-height (+ current-height duration))
+  )
+    (asserts! (>= duration u10000) ERR_INVALID_LOCK_TIME)
+    (map-set token-lock-time
+      { user: tx-sender }
+      { lock-height: end-height }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-weighted-voting-power (user principal))
+  (let (
+    (base-power (get amount (get-voting-power user)))
+    (lock-data (default-to { lock-height: u0 } (map-get? token-lock-time { user: user })))
+    (blocks-locked (- (get lock-height lock-data) stacks-block-height))
+    (multiplier (get-time-multiplier blocks-locked))
+  )
+    (* base-power multiplier)
+  )
+)
+
+
+
+(define-constant CATEGORY_GENERAL "general")
+(define-constant CATEGORY_CRITICAL "critical")
+(define-constant CATEGORY_MINOR "minor")
+
+(define-map category-thresholds
+  { category: (string-ascii 20) }
+  { 
+    min-votes: uint,
+    approval-percentage: uint
+  }
+)
+
+(define-public (set-category-threshold (category (string-ascii 20)) (min-votes uint) (approval-percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get dao-admin)) ERR_UNAUTHORIZED)
+    (map-set category-thresholds
+      { category: category }
+      { 
+        min-votes: min-votes,
+        approval-percentage: approval-percentage
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-category-threshold (category (string-ascii 20)))
+  (default-to 
+    { min-votes: u100, approval-percentage: u51 }
+    (map-get? category-thresholds { category: category })
+  )
+)
+
+(define-public (create-categorized-proposal 
+    (title (string-ascii 100)) 
+    (description (string-utf8 500)) 
+    (duration uint) 
+    (merkle-root (buff 32))
+    (category (string-ascii 20))
+  )
+  (let 
+    (
+      (proposal-id (+ (var-get proposal-count) u1))
+      (user-voting-power (get amount (get-voting-power tx-sender)))
+    )
+    (asserts! (>= user-voting-power (var-get min-voting-power)) ERR_INSUFFICIENT_TOKENS)
+    (asserts! (is-none (map-get? proposals { proposal-id: proposal-id })) ERR_PROPOSAL_ALREADY_EXISTS)
+    
+    (map-set proposals
+      { proposal-id: proposal-id }
+      {
+        title: title,
+        description: description,
+        proposer: tx-sender,
+        start-stacks-block-height: stacks-block-height,
+        end-stacks-block-height: (+ stacks-block-height duration),
+        yes-votes: u0,
+        no-votes: u0,
+        status: "active",
+        merkle-root: merkle-root,
+        category: category
+      }
+    )
+    
+    (var-set proposal-count proposal-id)
+    (ok proposal-id)
   )
 )
