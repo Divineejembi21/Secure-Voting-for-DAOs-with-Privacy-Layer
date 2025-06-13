@@ -4,6 +4,10 @@
 (define-constant ERR_PROPOSAL_EXPIRED (err u103))
 (define-constant ERR_ALREADY_VOTED (err u104))
 (define-constant ERR_INVALID_VOTE (err u105))
+(define-constant ERR_UNAUTHORIZED (err u200))
+(define-constant ERR_SELF_DELEGATION (err u201))
+(define-constant ERR_CIRCULAR_DELEGATION (err u202))
+(define-constant ERR_NO_DELEGATION (err u203))
 (define-constant ERR_INVALID_PROOF (err u106))
 (define-constant ERR_PROPOSAL_NOT_ENDED (err u107))
 (define-constant ERR_INSUFFICIENT_TOKENS (err u108))
@@ -326,5 +330,177 @@
     
     (var-set proposal-count proposal-id)
     (ok proposal-id)
+  )
+)
+
+
+
+(define-map delegations
+  { delegator: principal }
+  { delegate: principal, delegated-at: uint }
+)
+
+(define-map delegation-counts
+  { delegate: principal }
+  { count: uint }
+)
+
+(define-map delegated-power
+  { delegate: principal }
+  { total-power: uint }
+)
+
+(define-read-only (get-delegation (delegator principal))
+  (map-get? delegations { delegator: delegator })
+)
+
+(define-read-only (get-delegation-count (delegate principal))
+  (default-to { count: u0 } (map-get? delegation-counts { delegate: delegate }))
+)
+
+(define-read-only (get-delegated-power (delegate principal))
+  (default-to { total-power: u0 } (map-get? delegated-power { delegate: delegate }))
+)
+
+(define-read-only (get-effective-voting-power (user principal))
+  (let (
+    (base-power (contract-call? .wall get-weighted-voting-power user))
+    (delegated (get total-power (get-delegated-power user)))
+  )
+    (+ base-power delegated)
+  )
+)
+
+(define-read-only (is-delegating (user principal))
+  (is-some (get-delegation user))
+)
+
+(define-private (check-circular-delegation (delegator principal) (potential-delegate principal))
+  (let (
+    (delegate-delegation (get-delegation potential-delegate))
+  )
+    (match delegate-delegation
+      delegation-info 
+        (if (is-eq (get delegate delegation-info) delegator)
+          false
+          (check-circular-delegation delegator (get delegate delegation-info)))
+      true
+    )
+  )
+)
+
+(define-public (delegate-voting-power (delegate principal))
+  (let (
+    (delegator-power (contract-call? .wall get-weighted-voting-power tx-sender))
+    (current-delegated (get total-power (get-delegated-power delegate)))
+    (current-count (get count (get-delegation-count delegate)))
+    (existing-delegation (get-delegation tx-sender))
+  )
+    (asserts! (not (is-eq tx-sender delegate)) ERR_SELF_DELEGATION)
+    (asserts! (check-circular-delegation tx-sender delegate) ERR_CIRCULAR_DELEGATION)
+    
+    (match existing-delegation
+      old-delegation
+        (let (
+          (old-delegate (get delegate old-delegation))
+          (old-delegate-power (get total-power (get-delegated-power old-delegate)))
+          (old-delegate-count (get count (get-delegation-count old-delegate)))
+        )
+          (map-set delegated-power
+            { delegate: old-delegate }
+            { total-power: (- old-delegate-power delegator-power) }
+          )
+          (map-set delegation-counts
+            { delegate: old-delegate }
+            { count: (- old-delegate-count u1) }
+          )
+        )
+      true
+    )
+    
+    (map-set delegations
+      { delegator: tx-sender }
+      { delegate: delegate, delegated-at: stacks-block-height }
+    )
+    
+    (map-set delegated-power
+      { delegate: delegate }
+      { total-power: (+ current-delegated delegator-power) }
+    )
+    
+    (map-set delegation-counts
+      { delegate: delegate }
+      { count: (+ current-count u1) }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (revoke-delegation)
+  (let (
+    (delegation-info (unwrap! (get-delegation tx-sender) ERR_NO_DELEGATION))
+    (delegate (get delegate delegation-info))
+    (delegator-power (contract-call? .wall get-weighted-voting-power tx-sender))
+    (current-delegated (get total-power (get-delegated-power delegate)))
+    (current-count (get count (get-delegation-count delegate)))
+  )
+    (map-delete delegations { delegator: tx-sender })
+    
+    (map-set delegated-power
+      { delegate: delegate }
+      { total-power: (- current-delegated delegator-power) }
+    )
+    
+    (map-set delegation-counts
+      { delegate: delegate }
+      { count: (- current-count u1) }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (vote-as-delegate (proposal-id uint) (vote-value bool) (commitment-hash (buff 32)) (nullifier (buff 32)) (proof (buff 512)))
+  (let (
+    (effective-power (get-effective-voting-power tx-sender))
+    (min-power (contract-call? .wall get-min-voting-power))
+  )
+    (asserts! (>= effective-power min-power) (err u108))
+    (contract-call? .wall cast-vote proposal-id vote-value commitment-hash nullifier proof)
+  )
+)
+
+(define-read-only (get-min-voting-power)
+  (var-get min-voting-power)
+)
+
+(define-public (cast-vote-with-delegation (proposal-id uint) (vote-value bool) (commitment-hash (buff 32)) (nullifier (buff 32)) (proof (buff 512)))
+  (let
+    (
+      (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_DOES_NOT_EXIST))
+      (effective-power (contract-call? .delegation get-effective-voting-power tx-sender))
+    )
+    (asserts! (>= effective-power (var-get min-voting-power)) ERR_INSUFFICIENT_TOKENS)
+    (asserts! (is-proposal-active proposal-id) ERR_PROPOSAL_EXPIRED)
+    (asserts! (is-none (get-vote-receipt proposal-id tx-sender)) ERR_ALREADY_VOTED)
+    (asserts! (not (is-eq nullifier 0x)) ERR_INVALID_PROOF)
+    
+    (map-set vote-receipts
+      { proposal-id: proposal-id, voter: tx-sender }
+      { commitment-hash: commitment-hash, voted: true }
+    )
+    
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal 
+        {
+          yes-votes: (if vote-value (+ (get yes-votes proposal) u1) (get yes-votes proposal)),
+          no-votes: (if vote-value (get no-votes proposal) (+ (get no-votes proposal) u1))
+        }
+      )
+    )
+    
+    (ok true)
   )
 )
