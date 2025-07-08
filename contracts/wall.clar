@@ -4,17 +4,23 @@
 (define-constant ERR_PROPOSAL_EXPIRED (err u103))
 (define-constant ERR_ALREADY_VOTED (err u104))
 (define-constant ERR_INVALID_VOTE (err u105))
-(define-constant ERR_UNAUTHORIZED (err u200))
 (define-constant ERR_SELF_DELEGATION (err u201))
 (define-constant ERR_CIRCULAR_DELEGATION (err u202))
 (define-constant ERR_NO_DELEGATION (err u203))
 (define-constant ERR_INVALID_PROOF (err u106))
 (define-constant ERR_PROPOSAL_NOT_ENDED (err u107))
 (define-constant ERR_INSUFFICIENT_TOKENS (err u108))
+(define-constant ERR_INSUFFICIENT_TREASURY (err u109))
+(define-constant ERR_INVALID_BUDGET (err u110))
+(define-constant ERR_BUDGET_EXCEEDED (err u111))
+(define-constant ERR_SNAPSHOT_NOT_FOUND (err u112))
 
 (define-data-var dao-admin principal tx-sender)
 (define-data-var proposal-count uint u0)
 (define-data-var min-voting-power uint u100)
+(define-data-var treasury-balance uint u0)
+(define-data-var total-allocated uint u0)
+(define-data-var snapshot-count uint u0)
 
 (define-map proposals
   { proposal-id: uint }
@@ -28,7 +34,10 @@
     no-votes: uint,
     status: (string-ascii 20),
     merkle-root: (buff 32),
-    category: (string-ascii 20)
+    category: (string-ascii 20),
+    budget-requested: uint,
+    budget-allocated: uint,
+    snapshot-id: uint
   }
 )
 
@@ -40,6 +49,16 @@
 (define-map voting-power
   { user: principal }
   { amount: uint }
+)
+
+(define-map snapshots
+  { snapshot-id: uint }
+  { block-height: uint, total-supply: uint }
+)
+
+(define-map snapshot-balances
+  { snapshot-id: uint, user: principal }
+  { voting-power: uint, delegated-power: uint }
 )
 
 (define-read-only (get-dao-admin)
@@ -60,6 +79,37 @@
 
 (define-read-only (get-voting-power (user principal))
   (default-to { amount: u0 } (map-get? voting-power { user: user }))
+)
+
+(define-read-only (get-treasury-balance)
+  (var-get treasury-balance)
+)
+
+(define-read-only (get-available-treasury)
+  (- (var-get treasury-balance) (var-get total-allocated))
+)
+
+(define-read-only (get-total-allocated)
+  (var-get total-allocated)
+)
+
+(define-read-only (get-snapshot (snapshot-id uint))
+  (map-get? snapshots { snapshot-id: snapshot-id })
+)
+
+(define-read-only (get-snapshot-balance (snapshot-id uint) (user principal))
+  (default-to 
+    { voting-power: u0, delegated-power: u0 }
+    (map-get? snapshot-balances { snapshot-id: snapshot-id, user: user })
+  )
+)
+
+(define-read-only (get-snapshot-voting-power (snapshot-id uint) (user principal))
+  (let (
+    (snapshot-data (get-snapshot-balance snapshot-id user))
+  )
+    (+ (get voting-power snapshot-data) (get delegated-power snapshot-data))
+  )
 )
 
 (define-read-only (has-voted (proposal-id uint) (voter principal))
@@ -111,15 +161,76 @@
   )
 )
 
-(define-public (create-proposal (title (string-ascii 100)) (description (string-utf8 500)) (duration uint) (merkle-root (buff 32))     (category (string-ascii 20))
+(define-public (fund-treasury (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get dao-admin)) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_BUDGET)
+    (var-set treasury-balance (+ (var-get treasury-balance) amount))
+    (ok true)
+  )
 )
+
+(define-public (create-snapshot)
+  (let (
+    (snapshot-id (+ (var-get snapshot-count) u1))
+    (current-height stacks-block-height)
+  )
+    (asserts! (is-eq tx-sender (var-get dao-admin)) ERR_UNAUTHORIZED)
+    
+    (map-set snapshots
+      { snapshot-id: snapshot-id }
+      { block-height: current-height, total-supply: u0 }
+    )
+    
+    (var-set snapshot-count snapshot-id)
+    (ok snapshot-id)
+  )
+)
+
+(define-public (record-snapshot-balance (snapshot-id uint) (user principal))
+  (let (
+    (current-power (get-weighted-voting-power user))
+    (current-delegated (get total-power (get-delegated-power user)))
+  )
+    (asserts! (is-eq tx-sender (var-get dao-admin)) ERR_UNAUTHORIZED)
+    (asserts! (is-some (get-snapshot snapshot-id)) ERR_SNAPSHOT_NOT_FOUND)
+    
+    (map-set snapshot-balances
+      { snapshot-id: snapshot-id, user: user }
+      { voting-power: current-power, delegated-power: current-delegated }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (withdraw-treasury (amount uint) (recipient principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get dao-admin)) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_BUDGET)
+    (asserts! (<= amount (get-available-treasury)) ERR_INSUFFICIENT_TREASURY)
+    (var-set treasury-balance (- (var-get treasury-balance) amount))
+    (ok true)
+  )
+)
+
+(define-public (create-proposal-with-budget (title (string-ascii 100)) (description (string-utf8 500)) (duration uint) (merkle-root (buff 32)) (category (string-ascii 20)) (budget-requested uint))
   (let 
     (
       (proposal-id (+ (var-get proposal-count) u1))
       (user-voting-power (get amount (get-voting-power tx-sender)))
+      (snapshot-id (+ (var-get snapshot-count) u1))
     )
     (asserts! (>= user-voting-power (var-get min-voting-power)) ERR_INSUFFICIENT_TOKENS)
     (asserts! (is-none (map-get? proposals { proposal-id: proposal-id })) ERR_PROPOSAL_ALREADY_EXISTS)
+    (asserts! (<= budget-requested (get-available-treasury)) ERR_INSUFFICIENT_TREASURY)
+    
+    (map-set snapshots
+      { snapshot-id: snapshot-id }
+      { block-height: stacks-block-height, total-supply: u0 }
+    )
+    
+    (var-set snapshot-count snapshot-id)
     
     (map-set proposals
       { proposal-id: proposal-id }
@@ -133,8 +244,10 @@
         no-votes: u0,
         status: "active",
         merkle-root: merkle-root,
-        category: category
-
+        category: category,
+        budget-requested: budget-requested,
+        budget-allocated: u0,
+        snapshot-id: snapshot-id
       }
     )
     
@@ -147,23 +260,19 @@
   (let
     (
       (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_DOES_NOT_EXIST))
-      (user-voting-power (get amount (get-voting-power tx-sender)))
+      (snapshot-id (get snapshot-id proposal))
+      (user-snapshot-power (get-snapshot-voting-power snapshot-id tx-sender))
     )
-    (asserts! (>= user-voting-power (var-get min-voting-power)) ERR_INSUFFICIENT_TOKENS)
+    (asserts! (>= user-snapshot-power (var-get min-voting-power)) ERR_INSUFFICIENT_TOKENS)
     (asserts! (is-proposal-active proposal-id) ERR_PROPOSAL_EXPIRED)
     (asserts! (is-none (get-vote-receipt proposal-id tx-sender)) ERR_ALREADY_VOTED)
-    
-    ;; In a real implementation, we would verify the ZK proof here
-    ;; This is a simplified version that just checks the nullifier isn't empty
     (asserts! (not (is-eq nullifier 0x)) ERR_INVALID_PROOF)
     
-    ;; Record the vote commitment
     (map-set vote-receipts
       { proposal-id: proposal-id, voter: tx-sender }
       { commitment-hash: commitment-hash, voted: true }
     )
     
-    ;; Update vote counts
     (map-set proposals
       { proposal-id: proposal-id }
       (merge proposal 
@@ -203,24 +312,54 @@
   (let
     (
       (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_DOES_NOT_EXIST))
+      (budget-requested (get budget-requested proposal))
     )
     (asserts! (is-eq tx-sender (var-get dao-admin)) ERR_UNAUTHORIZED)
     (asserts! (is-eq (get status proposal) "passed") ERR_UNAUTHORIZED)
+    (asserts! (<= budget-requested (get-available-treasury)) ERR_INSUFFICIENT_TREASURY)
     
-    ;; In a real implementation, this would execute the proposal's actions
-    ;; For this MVP, we just mark it as executed
+    (var-set total-allocated (+ (var-get total-allocated) budget-requested))
+    
     (map-set proposals
       { proposal-id: proposal-id }
-      (merge proposal { status: "executed" })
+      (merge proposal { 
+        status: "executed",
+        budget-allocated: budget-requested
+      })
     )
     
     (ok true)
   )
 )
 
+(define-public (release-allocated-budget (proposal-id uint) (recipient principal))
+  (let
+    (
+      (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_DOES_NOT_EXIST))
+      (allocated-amount (get budget-allocated proposal))
+    )
+    (asserts! (is-eq tx-sender (var-get dao-admin)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status proposal) "executed") ERR_UNAUTHORIZED)
+    (asserts! (> allocated-amount u0) ERR_INVALID_BUDGET)
+    
+    (var-set treasury-balance (- (var-get treasury-balance) allocated-amount))
+    (var-set total-allocated (- (var-get total-allocated) allocated-amount))
+    
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal { 
+        status: "completed",
+        budget-allocated: u0
+      })
+    )
+    
+    (ok allocated-amount)
+  )
+)
 
 
-(define-constant ERR_INVALID_LOCK_TIME (err u112))
+
+(define-constant ERR_INVALID_LOCK_TIME (err u113))
 
 (define-map token-lock-time 
   { user: principal }
@@ -308,9 +447,17 @@
     (
       (proposal-id (+ (var-get proposal-count) u1))
       (user-voting-power (get amount (get-voting-power tx-sender)))
+      (snapshot-id (+ (var-get snapshot-count) u1))
     )
     (asserts! (>= user-voting-power (var-get min-voting-power)) ERR_INSUFFICIENT_TOKENS)
     (asserts! (is-none (map-get? proposals { proposal-id: proposal-id })) ERR_PROPOSAL_ALREADY_EXISTS)
+    
+    (map-set snapshots
+      { snapshot-id: snapshot-id }
+      { block-height: stacks-block-height, total-supply: u0 }
+    )
+    
+    (var-set snapshot-count snapshot-id)
     
     (map-set proposals
       { proposal-id: proposal-id }
@@ -324,7 +471,10 @@
         no-votes: u0,
         status: "active",
         merkle-root: merkle-root,
-        category: category
+        category: category,
+        budget-requested: u0,
+        budget-allocated: u0,
+        snapshot-id: snapshot-id
       }
     )
     
@@ -364,7 +514,7 @@
 
 (define-read-only (get-effective-voting-power (user principal))
   (let (
-    (base-power (contract-call? .wall get-weighted-voting-power user))
+    (base-power (get-weighted-voting-power user))
     (delegated (get total-power (get-delegated-power user)))
   )
     (+ base-power delegated)
@@ -381,9 +531,7 @@
   )
     (match delegate-delegation
       delegation-info 
-        (if (is-eq (get delegate delegation-info) delegator)
-          false
-          (check-circular-delegation delegator (get delegate delegation-info)))
+        (not (is-eq (get delegate delegation-info) delegator))
       true
     )
   )
@@ -391,7 +539,7 @@
 
 (define-public (delegate-voting-power (delegate principal))
   (let (
-    (delegator-power (contract-call? .wall get-weighted-voting-power tx-sender))
+    (delegator-power (get-weighted-voting-power tx-sender))
     (current-delegated (get total-power (get-delegated-power delegate)))
     (current-count (get count (get-delegation-count delegate)))
     (existing-delegation (get-delegation tx-sender))
@@ -441,7 +589,7 @@
   (let (
     (delegation-info (unwrap! (get-delegation tx-sender) ERR_NO_DELEGATION))
     (delegate (get delegate delegation-info))
-    (delegator-power (contract-call? .wall get-weighted-voting-power tx-sender))
+    (delegator-power (get-weighted-voting-power tx-sender))
     (current-delegated (get total-power (get-delegated-power delegate)))
     (current-count (get count (get-delegation-count delegate)))
   )
@@ -464,10 +612,10 @@
 (define-public (vote-as-delegate (proposal-id uint) (vote-value bool) (commitment-hash (buff 32)) (nullifier (buff 32)) (proof (buff 512)))
   (let (
     (effective-power (get-effective-voting-power tx-sender))
-    (min-power (contract-call? .wall get-min-voting-power))
+    (min-power (get-min-voting-power))
   )
     (asserts! (>= effective-power min-power) (err u108))
-    (contract-call? .wall cast-vote proposal-id vote-value commitment-hash nullifier proof)
+    (cast-vote proposal-id vote-value commitment-hash nullifier proof)
   )
 )
 
@@ -479,9 +627,10 @@
   (let
     (
       (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_DOES_NOT_EXIST))
-      (effective-power (contract-call? .delegation get-effective-voting-power tx-sender))
+      (snapshot-id (get snapshot-id proposal))
+      (snapshot-power (get-snapshot-voting-power snapshot-id tx-sender))
     )
-    (asserts! (>= effective-power (var-get min-voting-power)) ERR_INSUFFICIENT_TOKENS)
+    (asserts! (>= snapshot-power (var-get min-voting-power)) ERR_INSUFFICIENT_TOKENS)
     (asserts! (is-proposal-active proposal-id) ERR_PROPOSAL_EXPIRED)
     (asserts! (is-none (get-vote-receipt proposal-id tx-sender)) ERR_ALREADY_VOTED)
     (asserts! (not (is-eq nullifier 0x)) ERR_INVALID_PROOF)
