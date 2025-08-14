@@ -14,6 +14,10 @@
 (define-constant ERR_INVALID_BUDGET (err u110))
 (define-constant ERR_BUDGET_EXCEEDED (err u111))
 (define-constant ERR_SNAPSHOT_NOT_FOUND (err u112))
+(define-constant ERR_INSUFFICIENT_CREDITS (err u114))
+(define-constant ERR_INVALID_CREDIT_AMOUNT (err u115))
+(define-constant ERR_CREDITS_ALREADY_ALLOCATED (err u116))
+(define-constant ERR_MAX_CREDITS_EXCEEDED (err u117))
 
 (define-data-var dao-admin principal tx-sender)
 (define-data-var proposal-count uint u0)
@@ -21,6 +25,7 @@
 (define-data-var treasury-balance uint u0)
 (define-data-var total-allocated uint u0)
 (define-data-var snapshot-count uint u0)
+(define-data-var max-credits-per-proposal uint u100)
 
 (define-map proposals
   { proposal-id: uint }
@@ -59,6 +64,22 @@
 (define-map snapshot-balances
   { snapshot-id: uint, user: principal }
   { voting-power: uint, delegated-power: uint }
+)
+
+;; Quadratic voting system maps
+(define-map user-vote-credits
+  { user: principal }
+  { total-credits: uint, available-credits: uint }
+)
+
+(define-map proposal-credit-allocations
+  { proposal-id: uint, user: principal }
+  { credits-spent: uint, vote-weight: uint, vote-direction: bool }
+)
+
+(define-map quadratic-vote-totals
+  { proposal-id: uint }
+  { yes-weight: uint, no-weight: uint, total-participants: uint }
 )
 
 (define-read-only (get-dao-admin)
@@ -112,6 +133,49 @@
   )
 )
 
+;; Quadratic voting read-only functions
+(define-read-only (get-user-credits (user principal))
+  (default-to 
+    { total-credits: u0, available-credits: u0 }
+    (map-get? user-vote-credits { user: user })
+  )
+)
+
+(define-read-only (get-proposal-allocation (proposal-id uint) (user principal))
+  (map-get? proposal-credit-allocations { proposal-id: proposal-id, user: user })
+)
+
+(define-read-only (get-quadratic-vote-totals (proposal-id uint))
+  (default-to 
+    { yes-weight: u0, no-weight: u0, total-participants: u0 }
+    (map-get? quadratic-vote-totals { proposal-id: proposal-id })
+  )
+)
+
+;; Calculate square root using Newton's method approximation
+(define-private (sqrt-newton (n uint))
+  (if (is-eq n u0)
+    u0
+    (if (is-eq n u1)
+      u1
+      (let (
+        (x (/ n u2))
+        (x1 (/ (+ x (/ n x)) u2))
+        (x2 (/ (+ x1 (/ n x1)) u2))
+        (x3 (/ (+ x2 (/ n x2)) u2))
+        (x4 (/ (+ x3 (/ n x3)) u2))
+      )
+        x4
+      )
+    )
+  )
+)
+
+;; Calculate quadratic vote weight (square root of credits)
+(define-read-only (calculate-vote-weight (credits uint))
+  (sqrt-newton credits)
+)
+
 (define-read-only (has-voted (proposal-id uint) (voter principal))
   (match (get-vote-receipt proposal-id voter)
     receipt (get voted receipt)
@@ -147,6 +211,37 @@
   (begin
     (asserts! (is-eq tx-sender (var-get dao-admin)) ERR_UNAUTHORIZED)
     (ok (var-set min-voting-power amount))
+  )
+)
+
+;; Admin function to set maximum credits per proposal
+(define-public (set-max-credits-per-proposal (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get dao-admin)) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_CREDIT_AMOUNT)
+    (ok (var-set max-credits-per-proposal amount))
+  )
+)
+
+;; Allocate vote credits to users based on their voting power
+(define-public (allocate-user-credits (user principal))
+  (let (
+    (user-power (get-weighted-voting-power user))
+    (credits-to-allocate (/ user-power u10)) ;; 1 credit per 10 voting power
+    (current-credits (get-user-credits user))
+  )
+    (asserts! (is-eq tx-sender (var-get dao-admin)) ERR_UNAUTHORIZED)
+    (asserts! (> user-power u0) ERR_INSUFFICIENT_TOKENS)
+    
+    (map-set user-vote-credits
+      { user: user }
+      { 
+        total-credits: (+ (get total-credits current-credits) credits-to-allocate),
+        available-credits: (+ (get available-credits current-credits) credits-to-allocate)
+      }
+    )
+    
+    (ok credits-to-allocate)
   )
 )
 
@@ -653,3 +748,129 @@
     (ok true)
   )
 )
+
+;; Core quadratic voting function
+(define-public (cast-quadratic-vote (proposal-id uint) (vote-value bool) (credits-to-spend uint) (commitment-hash (buff 32)) (nullifier (buff 32)) (proof (buff 512)))
+  (let (
+    (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_DOES_NOT_EXIST))
+    (user-credits (get-user-credits tx-sender))
+    (available-credits (get available-credits user-credits))
+    (vote-weight (calculate-vote-weight credits-to-spend))
+    (current-totals (get-quadratic-vote-totals proposal-id))
+    (existing-allocation (get-proposal-allocation proposal-id tx-sender))
+  )
+    ;; Validation checks
+    (asserts! (is-proposal-active proposal-id) ERR_PROPOSAL_EXPIRED)
+    (asserts! (> credits-to-spend u0) ERR_INVALID_CREDIT_AMOUNT)
+    (asserts! (<= credits-to-spend (var-get max-credits-per-proposal)) ERR_MAX_CREDITS_EXCEEDED)
+    (asserts! (<= credits-to-spend available-credits) ERR_INSUFFICIENT_CREDITS)
+    (asserts! (is-none existing-allocation) ERR_CREDITS_ALREADY_ALLOCATED)
+    (asserts! (not (is-eq nullifier 0x)) ERR_INVALID_PROOF)
+    
+    ;; Record the vote commitment for privacy
+    (map-set vote-receipts
+      { proposal-id: proposal-id, voter: tx-sender }
+      { commitment-hash: commitment-hash, voted: true }
+    )
+    
+    ;; Record credit allocation
+    (map-set proposal-credit-allocations
+      { proposal-id: proposal-id, user: tx-sender }
+      { 
+        credits-spent: credits-to-spend,
+        vote-weight: vote-weight,
+        vote-direction: vote-value
+      }
+    )
+    
+    ;; Update user's available credits
+    (map-set user-vote-credits
+      { user: tx-sender }
+      (merge user-credits {
+        available-credits: (- available-credits credits-to-spend)
+      })
+    )
+    
+    ;; Update proposal totals with quadratic weights
+    (map-set quadratic-vote-totals
+      { proposal-id: proposal-id }
+      {
+        yes-weight: (if vote-value 
+                      (+ (get yes-weight current-totals) vote-weight)
+                      (get yes-weight current-totals)),
+        no-weight: (if vote-value 
+                     (get no-weight current-totals)
+                     (+ (get no-weight current-totals) vote-weight)),
+        total-participants: (+ (get total-participants current-totals) u1)
+      }
+    )
+    
+    (ok vote-weight)
+  )
+)
+
+;; Allow users to increase their vote on existing allocation
+(define-public (increase-quadratic-vote (proposal-id uint) (additional-credits uint) (commitment-hash (buff 32)) (nullifier (buff 32)) (proof (buff 512)))
+  (let (
+    (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_DOES_NOT_EXIST))
+    (user-credits (get-user-credits tx-sender))
+    (available-credits (get available-credits user-credits))
+    (existing-allocation (unwrap! (get-proposal-allocation proposal-id tx-sender) ERR_CREDITS_ALREADY_ALLOCATED))
+    (current-credits (get credits-spent existing-allocation))
+    (new-total-credits (+ current-credits additional-credits))
+    (new-vote-weight (calculate-vote-weight new-total-credits))
+    (old-vote-weight (get vote-weight existing-allocation))
+    (vote-direction (get vote-direction existing-allocation))
+    (current-totals (get-quadratic-vote-totals proposal-id))
+  )
+    ;; Validation checks
+    (asserts! (is-proposal-active proposal-id) ERR_PROPOSAL_EXPIRED)
+    (asserts! (> additional-credits u0) ERR_INVALID_CREDIT_AMOUNT)
+    (asserts! (<= new-total-credits (var-get max-credits-per-proposal)) ERR_MAX_CREDITS_EXCEEDED)
+    (asserts! (<= additional-credits available-credits) ERR_INSUFFICIENT_CREDITS)
+    (asserts! (not (is-eq nullifier 0x)) ERR_INVALID_PROOF)
+    
+    ;; Update vote commitment
+    (map-set vote-receipts
+      { proposal-id: proposal-id, voter: tx-sender }
+      { commitment-hash: commitment-hash, voted: true }
+    )
+    
+    ;; Update credit allocation
+    (map-set proposal-credit-allocations
+      { proposal-id: proposal-id, user: tx-sender }
+      { 
+        credits-spent: new-total-credits,
+        vote-weight: new-vote-weight,
+        vote-direction: vote-direction
+      }
+    )
+    
+    ;; Update user's available credits
+    (map-set user-vote-credits
+      { user: tx-sender }
+      (merge user-credits {
+        available-credits: (- available-credits additional-credits)
+      })
+    )
+    
+    ;; Update proposal totals (remove old weight, add new weight)
+    (map-set quadratic-vote-totals
+      { proposal-id: proposal-id }
+      {
+        yes-weight: (if vote-direction 
+                      (+ (- (get yes-weight current-totals) old-vote-weight) new-vote-weight)
+                      (get yes-weight current-totals)),
+        no-weight: (if vote-direction 
+                     (get no-weight current-totals)
+                     (+ (- (get no-weight current-totals) old-vote-weight) new-vote-weight)),
+        total-participants: (get total-participants current-totals)
+      }
+    )
+    
+    (ok new-vote-weight)
+  )
+)
+
+
+
